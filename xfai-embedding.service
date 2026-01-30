@@ -1,0 +1,29 @@
+[Unit]
+Description=XFAI Embedding Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/web/services/xfai-embedding
+Environment="XFAI_EMBED_HOST=127.0.0.1"
+Environment="XFAI_EMBED_PORT=8765"
+Environment="HF_HOME=/opt/xfai-embedding/cache"
+Environment="TRANSFORMERS_CACHE=/opt/xfai-embedding/cache"
+ExecStart=/usr/local/bin/python3 server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/web/services/xfai-embedding
+ReadWritePaths=/opt/xfai-embedding/cache
+
+[Install]
+WantedBy=multi-user.target

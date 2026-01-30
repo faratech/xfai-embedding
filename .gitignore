@@ -1,0 +1,13 @@
+# Model cache (symlinked to /opt/xfai-embedding/cache)
+cache/
+
+# Virtual environment
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
