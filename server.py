@@ -40,7 +40,7 @@ if not OPENAI_API_KEY:
 # Cross-encoder config
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"  # Higher accuracy reranker (~130ms for 20 docs)
 RERANK_MODEL = None  # Loaded at startup
-THREAD_POOL = ThreadPoolExecutor(max_workers=2)  # For blocking cross-encoder inference
+THREAD_POOL = ThreadPoolExecutor()  # For blocking cross-encoder inference
 
 
 class EmbedRequest(BaseModel):
