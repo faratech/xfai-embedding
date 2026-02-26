@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 import uvicorn
+import tiktoken
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +27,19 @@ logger = logging.getLogger(__name__)
 # OpenAI config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "text-embedding-3-small"  # 1536 dimensions, matches cached embeddings
+MAX_TOKENS = 8191  # text-embedding-3-small context limit
+
+# Load tiktoken encoder once at startup
+TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+
+def truncate_to_tokens(text: str, max_tokens: int = MAX_TOKENS) -> str:
+    """Truncate text to fit within the token limit using exact token counting."""
+    tokens = TOKENIZER.encode(text)
+    if len(tokens) <= max_tokens:
+        return text
+    truncated_tokens = tokens[:max_tokens]
+    return TOKENIZER.decode(truncated_tokens)
 
 # Load API key from .env if not in environment
 if not OPENAI_API_KEY:
@@ -44,7 +58,7 @@ THREAD_POOL = ThreadPoolExecutor()  # For blocking cross-encoder inference
 
 
 class EmbedRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=10000)
+    text: str = Field(..., min_length=1)
     type: str = Field(default="query", pattern="^(query|document)$")
 
 
@@ -97,6 +111,8 @@ async def get_openai_embedding(text: str) -> List[float]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
+    text = truncate_to_tokens(text)
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             "https://api.openai.com/v1/embeddings",
@@ -122,6 +138,8 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """Get embeddings for multiple texts from OpenAI API."""
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
+
+    texts = [truncate_to_tokens(t) for t in texts]
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         response = await client.post(
