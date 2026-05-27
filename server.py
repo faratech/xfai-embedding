@@ -105,6 +105,16 @@ class RerankResponse(BaseModel):
     results: List[RerankResult]
     model: str
 
+HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    global HTTP_CLIENT
+    if HTTP_CLIENT is None:
+        HTTP_CLIENT = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        )
+    return HTTP_CLIENT
+
 
 async def get_openai_embedding(text: str) -> List[float]:
     """Get embedding from OpenAI API."""
@@ -112,26 +122,26 @@ async def get_openai_embedding(text: str) -> List[float]:
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
     text = truncate_to_tokens(text)
+    client = await get_http_client()
+    response = await client.post(
+        "https://api.openai.com/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": OPENAI_MODEL,
+            "input": text
+        },
+        timeout=30.0
+    )
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": OPENAI_MODEL,
-                "input": text
-            }
-        )
+    if response.status_code != 200:
+        logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
+        raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
 
-        if response.status_code != 200:
-            logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
-            raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
-
-        data = response.json()
-        return data["data"][0]["embedding"]
+    data = response.json()
+    return data["data"][0]["embedding"]
 
 
 async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
@@ -140,33 +150,43 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
     texts = [truncate_to_tokens(t) for t in texts]
+    client = await get_http_client()
+    response = await client.post(
+        "https://api.openai.com/v1/embeddings",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": OPENAI_MODEL,
+            "input": texts
+        },
+        timeout=60.0
+    )
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": OPENAI_MODEL,
-                "input": texts
-            }
-        )
+    if response.status_code != 200:
+        logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
+        raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
 
-        if response.status_code != 200:
-            logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
-            raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
-
-        data = response.json()
-        # Sort by index to maintain order
-        sorted_data = sorted(data["data"], key=lambda x: x["index"])
-        return [item["embedding"] for item in sorted_data]
+    data = response.json()
+    # Sort by index to maintain order
+    sorted_data = sorted(data["data"], key=lambda x: x["index"])
+    return [item["embedding"] for item in sorted_data]
 
 
 def load_rerank_model():
     """Load cross-encoder model for reranking."""
     global RERANK_MODEL
+    try:
+        import torch
+        torch.set_num_threads(1)
+        torch.set_grad_enabled(False)
+        logger.info("Configured PyTorch to use 1 thread and disabled gradients globally")
+    except ImportError:
+        logger.warning("torch not installed - threading options skipped")
+    except Exception as e:
+        logger.warning(f"Failed to configure torch threading: {e}")
+
     try:
         from sentence_transformers import CrossEncoder
         logger.info(f"Loading cross-encoder model: {RERANK_MODEL_NAME}")
@@ -196,6 +216,11 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    global HTTP_CLIENT
+    if HTTP_CLIENT is not None:
+        await HTTP_CLIENT.aclose()
+        HTTP_CLIENT = None
+        logger.info("Shared HTTP client closed gracefully")
     THREAD_POOL.shutdown(wait=False)
 
 
