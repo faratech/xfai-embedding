@@ -204,6 +204,30 @@ def load_rerank_model():
         return False
 
 
+def _malloc_trim() -> None:
+    """Release freed glibc heap pages back to the OS."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None)
+        if hasattr(libc, "malloc_trim"):
+            libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+async def memory_trimmer_task(interval: int = 300):
+    """Periodically triggers Python garbage collection and trims glibc heap."""
+    import gc
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            gc.collect()
+            _malloc_trim()
+            logger.debug("Periodic memory garbage collection and heap trimming completed.")
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load models and check configuration."""
@@ -215,6 +239,13 @@ async def lifespan(app: FastAPI):
     # Load cross-encoder model in thread pool to avoid blocking
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(THREAD_POOL, load_rerank_model)
+
+    # Start periodic memory trimmer
+    trim_task = asyncio.create_task(memory_trimmer_task(300))
+    app.state.memory_trimmer = trim_task
+
+    # Release model-loading memory spikes back to the OS
+    _malloc_trim()
 
     yield
 
