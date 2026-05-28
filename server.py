@@ -54,7 +54,10 @@ if not OPENAI_API_KEY:
 # Cross-encoder config
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"  # Higher accuracy reranker (~130ms for 20 docs)
 RERANK_MODEL = None  # Loaded at startup
-THREAD_POOL = ThreadPoolExecutor()  # For blocking cross-encoder inference
+# Cap workers: torch.set_num_threads(1) means parallel reranks just contend
+# for one CPU. 4 is plenty for the load-once + per-request inference uses,
+# and avoids 8MB virtual stack × dozens of idle threads.
+THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="xfai-rerank")
 
 
 class EmbedRequest(BaseModel):

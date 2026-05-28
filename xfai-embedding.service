@@ -11,6 +11,14 @@ Environment="XFAI_EMBED_HOST=127.0.0.1"
 Environment="XFAI_EMBED_PORT=8765"
 Environment="HF_HOME=/opt/xfai-embedding/cache"
 Environment="TRANSFORMERS_CACHE=/opt/xfai-embedding/cache"
+# Single-thread BLAS/OMP — torch.set_num_threads(1) only caps torch's own
+# pool; OpenBLAS/OMP/MKL allocate per-thread workspaces independently.
+Environment="OPENBLAS_NUM_THREADS=1"
+Environment="OMP_NUM_THREADS=1"
+Environment="MKL_NUM_THREADS=1"
+# Limit glibc arenas: default 8×nproc holds freed pages per-arena, causing
+# severe fragmentation for bursty model + BLAS allocations.
+Environment="MALLOC_ARENA_MAX=2"
 ExecStart=/usr/local/bin/python3 server.py
 Restart=always
 RestartSec=5
