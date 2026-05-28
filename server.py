@@ -216,14 +216,14 @@ def _malloc_trim() -> None:
 
 
 async def memory_trimmer_task(interval: int = 300):
-    """Periodically triggers Python garbage collection and trims glibc heap."""
-    import gc
+    """Periodically trim glibc heap. No gc.collect() — Python's refcount GC
+    handles dead objects synchronously; forcing a full cycle collection here
+    has no upside for this service and risks unexpected finalizer behavior."""
     while True:
         await asyncio.sleep(interval)
         try:
-            gc.collect()
             _malloc_trim()
-            logger.debug("Periodic memory garbage collection and heap trimming completed.")
+            logger.debug("Periodic heap trim completed.")
         except Exception:
             pass
 
