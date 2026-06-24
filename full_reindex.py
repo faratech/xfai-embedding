@@ -25,7 +25,7 @@ NUM_WORKERS = 8
 MYSQL_CONFIG = {
     'unix_socket': '/run/mysqld/mysqld.sock',
     'user': 'root',
-    'password': 'GqGKjT5vEoIzod/OaB7bgQ==',
+    'password': ([l.split("'")[-2] for l in open('/web/public_html/src/config.php') if l.strip().startswith("$config['db']['password']")] or [''])[0],
     'database': 'wf_wf',
     'charset': 'utf8mb4',
     'cursorclass': pymysql.cursors.DictCursor,

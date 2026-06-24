@@ -14,7 +14,7 @@ import sys
 DB_CONFIG = {
     'host': 'localhost',
     'user': 'root',
-    'password': 'GqGKjT5vEoIzod/OaB7bgQ==',
+    'password': ([l.split("'")[-2] for l in open('/web/public_html/src/config.php') if l.strip().startswith("$config['db']['password']")] or [''])[0],
     'database': 'wf_wf',
     'autocommit': True,
     'charset': 'utf8mb4'
