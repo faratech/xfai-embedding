@@ -22,9 +22,15 @@ python3 generate_all_embeddings.py --yes       # Full sync: MySQL + ES, 3-phase
 python3 generate_all_embeddings.py --dry-run   # Count missing only
 python3 bulk_vectorize.py --workers=8 --batch=50  # Parallel ES-only vectorization
 python3 fill_missing.py                        # Backfill missing ES vectors via OpenAI
-python3 fast_reindex.py                        # Rebuild ES from cached MySQL embeddings (destructive)
+python3 fast_reindex.py --help                 # Retired guard; never reindexes
 python3 full_reindex.py                        # Full rebuild: MySQL -> embeddings -> ES (destructive)
 ```
+
+The only supported fast reindexer is
+`/web/public_html/src/addons/XFES/fast_reindex.py`. Every manual invocation,
+including a full destructive rebuild, must run under
+`flock -w 60 /tmp/cron_locks/fast_reindex.lock`. The legacy script in this
+directory is deliberately inert so it cannot delete or replace the live index.
 
 ## Architecture
 
@@ -57,7 +63,7 @@ The cross-encoder model runs blocking inference, so `server.py` dispatches it th
 |----------|--------|---------|
 | `/health` | GET | Health check, returns model status |
 | `/embed` | POST | Single text embedding |
-| `/embed_batch` | POST | Batch embeddings (up to 500 texts) |
+| `/embed_batch` | POST | Batch embeddings (up to 500 texts; internally split below the API's aggregate token limit) |
 | `/rerank` | POST | Cross-encoder reranking (up to 100 docs) |
 
 ## Configuration

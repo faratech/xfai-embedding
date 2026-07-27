@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "text-embedding-3-small"  # 1536 dimensions, matches cached embeddings
 MAX_TOKENS = 8191  # text-embedding-3-small context limit
+MAX_BATCH_TOKENS = 200_000  # API limit is 300k; legacy corpus counts ~30% higher server-side
+MAX_BATCH_RETRIES = 6
+BATCH_REQUEST_DELAY_SECONDS = 2.0
 
 # Load tiktoken encoder once at startup
 TOKENIZER = tiktoken.get_encoding("cl100k_base")
@@ -154,27 +157,63 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
 
     texts = [truncate_to_tokens(t) for t in texts]
     client = await get_http_client()
-    response = await client.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": OPENAI_MODEL,
-            "input": texts
-        },
-        timeout=60.0
-    )
+    token_counts = [len(TOKENIZER.encode(text)) for text in texts]
+    batches: List[List[str]] = []
+    current_batch: List[str] = []
+    current_tokens = 0
 
-    if response.status_code != 200:
-        logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
-        raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
+    for text, token_count in zip(texts, token_counts):
+        if current_batch and current_tokens + token_count > MAX_BATCH_TOKENS:
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = 0
+        current_batch.append(text)
+        current_tokens += token_count
 
-    data = response.json()
-    # Sort by index to maintain order
-    sorted_data = sorted(data["data"], key=lambda x: x["index"])
-    return [item["embedding"] for item in sorted_data]
+    if current_batch:
+        batches.append(current_batch)
+
+    embeddings: List[List[float]] = []
+    for batch_index, batch in enumerate(batches):
+        response = None
+        for attempt in range(MAX_BATCH_RETRIES):
+            response = await client.post(
+                "https://api.openai.com/v1/embeddings",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": OPENAI_MODEL,
+                    "input": batch
+                },
+                timeout=60.0
+            )
+
+            if response.status_code != 429:
+                break
+
+            retry_after = response.headers.get("retry-after")
+            try:
+                delay = max(1.0, float(retry_after)) if retry_after else min(8.0, 2.0 ** attempt)
+            except ValueError:
+                delay = min(8.0, 2.0 ** attempt)
+            logger.warning("Embedding rate limit reached; retrying batch in %.1fs", delay)
+            await asyncio.sleep(delay)
+
+        if response is None or response.status_code != 200:
+            status = response.status_code if response is not None else 502
+            detail = response.text if response is not None else "No response"
+            logger.error(f"OpenAI API error: {status} - {detail}")
+            raise HTTPException(status_code=502, detail=f"OpenAI API error: {status}")
+
+        data = response.json()
+        sorted_data = sorted(data["data"], key=lambda x: x["index"])
+        embeddings.extend(item["embedding"] for item in sorted_data)
+        if batch_index + 1 < len(batches):
+            await asyncio.sleep(BATCH_REQUEST_DELAY_SECONDS)
+
+    return embeddings
 
 
 def load_rerank_model():
