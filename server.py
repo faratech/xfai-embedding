@@ -95,9 +95,19 @@ class RerankDocument(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000, description="Document text to rank")
 
 
+class RerankPair(BaseModel):
+    id: Optional[str] = Field(None, description="Optional caller id echoed back")
+    query: str = Field(..., min_length=1, max_length=1000, description="Query text")
+    document: str = Field(..., min_length=1, max_length=5000, description="Document text")
+
+
 class RerankRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=1000, description="Search query")
-    documents: List[RerankDocument] = Field(..., min_length=1, max_length=100, description="Documents to rerank")
+    query: Optional[str] = Field(None, min_length=1, max_length=1000, description="Search query")
+    documents: Optional[List[RerankDocument]] = Field(None, min_length=1, max_length=100, description="Documents to rerank")
+    # Independent (query, document) pairs — audit 2026-09-03 #373: the news
+    # dedupe gate scores BOTH directions of every pair, so per-pair requests
+    # doubled the per-request overhead. Mutually exclusive with query/documents.
+    pairs: Optional[List[RerankPair]] = Field(None, min_length=1, max_length=100, description="Independent query/document pairs to score")
     top_k: int = Field(default=10, ge=1, le=100, description="Number of top results to return")
 
 
@@ -361,8 +371,9 @@ def run_cross_encoder_rerank(query: str, documents: List[RerankDocument], top_k:
     # Build query-document pairs
     pairs = [(query, doc.text) for doc in documents]
 
-    # Get scores from cross-encoder
-    scores = RERANK_MODEL.predict(pairs)
+    # Get scores from cross-encoder. show_progress_bar=False (#373): the
+    # default tqdm output was ~37k journald lines/day from the dedupe gate.
+    scores = RERANK_MODEL.predict(pairs, show_progress_bar=False)
 
     # Create results with original indices
     results = []
@@ -392,6 +403,41 @@ async def rerank(request: RerankRequest):
         raise HTTPException(
             status_code=503,
             detail="Cross-encoder model not available. Install sentence-transformers to enable reranking."
+        )
+
+    if request.pairs and (request.documents or request.query):
+        raise HTTPException(
+            status_code=422,
+            detail="Use either 'pairs' or 'query'+'documents', not both."
+        )
+    if request.pairs and not (request.documents and request.query):
+        # Independent (query, document) pairs — each scored on its own.
+        def score_pairs() -> List[RerankResult]:
+            scored = [
+                (pair, float(score))
+                for pair, score in zip(
+                    request.pairs,
+                    RERANK_MODEL.predict(
+                        [(p.query, p.document) for p in request.pairs],
+                        show_progress_bar=False,
+                    ),
+                )
+            ]
+            results = [
+                RerankResult(id=pair.id if pair.id else str(i), score=score, index=i)
+                for i, (pair, score) in enumerate(scored)
+            ]
+            results.sort(key=lambda r: r.score, reverse=True)
+            return results[: request.top_k]
+
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(THREAD_POOL, score_pairs)
+        return RerankResponse(results=results, model=RERANK_MODEL_NAME)
+
+    if not (request.documents and request.query):
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either 'pairs' or both 'query' and 'documents'."
         )
 
     try:

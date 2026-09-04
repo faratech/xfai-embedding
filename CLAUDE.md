@@ -29,7 +29,7 @@ python3 full_reindex.py                        # Full rebuild: MySQL -> embeddin
 The only supported fast reindexer is
 `/web/public_html/src/addons/XFES/fast_reindex.py`. Every manual invocation,
 including a full destructive rebuild, must run under
-`flock -w 60 /tmp/cron_locks/fast_reindex.lock`. The legacy script in this
+`flock -w 60 /tmp/xf_fast_reindex_cron.lock`. The legacy script in this
 directory is deliberately inert so it cannot delete or replace the live index.
 
 ## Architecture
