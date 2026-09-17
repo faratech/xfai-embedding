@@ -11,6 +11,9 @@ import os
 import logging
 import asyncio
 import httpx
+from collections import OrderedDict
+import hashlib
+import threading
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -61,6 +64,19 @@ RERANK_MODEL = None  # Loaded at startup
 # for one CPU. 4 is plenty for the load-once + per-request inference uses,
 # and avoids 8MB virtual stack × dozens of idle threads.
 THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="xfai-rerank")
+
+# Deterministic in-memory LRU cache for cross-encoder scores: key -> score (float)
+_RERANK_CACHE = OrderedDict()
+_RERANK_CACHE_MAX = 50_000
+_RERANK_CACHE_LOCK = threading.Lock()
+
+
+def _get_pair_cache_key(query: str, doc_text: str) -> str:
+    h = hashlib.sha256()
+    h.update(query.strip().lower().encode("utf-8"))
+    h.update(b"\x00")
+    h.update(doc_text.encode("utf-8"))
+    return h.hexdigest()
 
 
 class EmbedRequest(BaseModel):
@@ -127,6 +143,7 @@ async def get_http_client() -> httpx.AsyncClient:
     global HTTP_CLIENT
     if HTTP_CLIENT is None:
         HTTP_CLIENT = httpx.AsyncClient(
+            http2=True,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
         )
     return HTTP_CLIENT
@@ -231,9 +248,9 @@ def load_rerank_model():
     global RERANK_MODEL
     try:
         import torch
-        torch.set_num_threads(1)
+        torch.set_num_threads(4)
         torch.set_grad_enabled(False)
-        logger.info("Configured PyTorch to use 1 thread and disabled gradients globally")
+        logger.info("Configured PyTorch to use 4 threads and disabled gradients globally")
     except ImportError:
         logger.warning("torch not installed - threading options skipped")
     except Exception as e:
@@ -277,6 +294,18 @@ async def memory_trimmer_task(interval: int = 300):
             pass
 
 
+async def openai_connection_keepalive(interval: int = 45):
+    """Keep HTTP/2 connection alive to api.openai.com to avoid TLS handshake penalty."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            if OPENAI_API_KEY:
+                client = await get_http_client()
+                await client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {OPENAI_API_KEY}"}, timeout=5.0)
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: load models and check configuration."""
@@ -292,6 +321,10 @@ async def lifespan(app: FastAPI):
     # Start periodic memory trimmer
     trim_task = asyncio.create_task(memory_trimmer_task(300))
     app.state.memory_trimmer = trim_task
+
+    # Start HTTP/2 keepalive task to OpenAI
+    keepalive_task = asyncio.create_task(openai_connection_keepalive(45))
+    app.state.keepalive_task = keepalive_task
 
     # Release model-loading memory spikes back to the OS
     _malloc_trim()
@@ -364,23 +397,43 @@ async def embed_batch(request: EmbedBatchRequest):
 
 
 def run_cross_encoder_rerank(query: str, documents: List[RerankDocument], top_k: int) -> List[RerankResult]:
-    """Run cross-encoder inference (blocking, called via thread pool)."""
+    """Run cross-encoder inference with deterministic LRU score cache."""
     if RERANK_MODEL is None:
         raise ValueError("Cross-encoder model not loaded")
 
-    # Build query-document pairs
-    pairs = [(query, doc.text) for doc in documents]
+    scores = [None] * len(documents)
+    uncached_indices = []
+    uncached_pairs = []
 
-    # Get scores from cross-encoder. show_progress_bar=False (#373): the
-    # default tqdm output was ~37k journald lines/day from the dedupe gate.
-    scores = RERANK_MODEL.predict(pairs, show_progress_bar=False)
+    # Check LRU cache first (< 0.01ms)
+    with _RERANK_CACHE_LOCK:
+        for i, doc in enumerate(documents):
+            key = _get_pair_cache_key(query, doc.text)
+            if key in _RERANK_CACHE:
+                scores[i] = _RERANK_CACHE[key]
+                _RERANK_CACHE.move_to_end(key)
+            else:
+                uncached_indices.append(i)
+                uncached_pairs.append((query, doc.text))
+
+    # Run inference only on uncached pairs
+    if uncached_pairs:
+        computed_scores = RERANK_MODEL.predict(uncached_pairs, show_progress_bar=False)
+        with _RERANK_CACHE_LOCK:
+            for idx, (q, txt), sc in zip(uncached_indices, uncached_pairs, computed_scores):
+                score_val = float(sc)
+                scores[idx] = score_val
+                key = _get_pair_cache_key(q, txt)
+                _RERANK_CACHE[key] = score_val
+                if len(_RERANK_CACHE) > _RERANK_CACHE_MAX:
+                    _RERANK_CACHE.popitem(last=False)
 
     # Create results with original indices
     results = []
     for i, (doc, score) in enumerate(zip(documents, scores)):
         results.append(RerankResult(
             id=doc.id,
-            score=float(score),
+            score=float(score if score is not None else 0.0),
             index=i
         ))
 
