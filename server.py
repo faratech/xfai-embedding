@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 # OpenAI config
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = "text-embedding-3-small"  # 1536 dimensions, matches cached embeddings
+# Every OpenAI call this service makes lands one row in wf_ai_usage_log via the
+# aiapi tracker (loopback-trusted). ~1,200 calls/day were invisible to the
+# ledger until 2026-09-18.
+TOKEN_TRACK_URL = os.getenv("TOKEN_TRACK_URL", "http://127.0.0.1:8001/token/track")
 MAX_TOKENS = 8191  # text-embedding-3-small context limit
 MAX_BATCH_TOKENS = 200_000  # API limit is 300k; legacy corpus counts ~30% higher server-side
 MAX_BATCH_RETRIES = 6
@@ -149,6 +153,26 @@ async def get_http_client() -> httpx.AsyncClient:
     return HTTP_CLIENT
 
 
+async def _meter_embedding_usage(data: dict, request_source: str, n_inputs: int) -> None:
+    """Best-effort ledger row for one embeddings response; never raises."""
+    try:
+        usage = data.get("usage") or {}
+        prompt = int(usage.get("prompt_tokens") or usage.get("total_tokens") or 0)
+        if prompt <= 0:
+            return
+        client = await get_http_client()
+        await client.post(TOKEN_TRACK_URL, json={
+            "user_id": 125694,
+            "model": data.get("model") or OPENAI_MODEL,
+            "input_text": f"{n_inputs} embedding input(s)",
+            "output_text": "",
+            "request_source": request_source,
+            "usage_data": {"input_tokens": prompt, "output_tokens": 0, "total_tokens": prompt},
+        }, timeout=5.0)
+    except Exception as exc:
+        logger.warning("embedding usage metering failed: %s", exc)
+
+
 async def get_openai_embedding(text: str) -> List[float]:
     """Get embedding from OpenAI API."""
     if not OPENAI_API_KEY:
@@ -174,6 +198,7 @@ async def get_openai_embedding(text: str) -> List[float]:
         raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
 
     data = response.json()
+    asyncio.ensure_future(_meter_embedding_usage(data, "xfai_embed", 1))
     return data["data"][0]["embedding"]
 
 
@@ -235,6 +260,7 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
             raise HTTPException(status_code=502, detail=f"OpenAI API error: {status}")
 
         data = response.json()
+        asyncio.ensure_future(_meter_embedding_usage(data, "xfai_embed_batch", len(batch)))
         sorted_data = sorted(data["data"], key=lambda x: x["index"])
         embeddings.extend(item["embedding"] for item in sorted_data)
         if batch_index + 1 < len(batches):
