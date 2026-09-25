@@ -36,6 +36,7 @@ from elasticsearch.helpers import streaming_bulk, scan
 sys.path.insert(0, '/web/fastapi_app')
 from dotenv import load_dotenv
 load_dotenv('/web/.env')
+load_dotenv('/web/.config')
 
 from db_pool import get_async_db_cursor
 from embedding_hash_utils import compute_content_hash
