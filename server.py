@@ -14,6 +14,7 @@ import httpx
 from collections import OrderedDict
 import hashlib
 import threading
+import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -180,18 +181,26 @@ async def get_openai_embedding(text: str) -> List[float]:
 
     text = truncate_to_tokens(text)
     client = await get_http_client()
-    response = await client.post(
-        "https://api.openai.com/v1/embeddings",
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        },
-        json={
-            "model": OPENAI_MODEL,
-            "input": text
-        },
-        timeout=30.0
-    )
+    started = time.monotonic()
+    try:
+        response = await client.post(
+            "https://api.openai.com/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": OPENAI_MODEL,
+                "input": text
+            },
+            timeout=30.0
+        )
+    except httpx.HTTPError as e:
+        logger.warning("Embedding upstream error type=%s elapsed_ms=%d", type(e).__name__, round((time.monotonic() - started) * 1000))
+        raise
+    elapsed_ms = round((time.monotonic() - started) * 1000)
+    if elapsed_ms >= 1000:
+        logger.warning("Embedding upstream slow status=%d elapsed_ms=%d", response.status_code, elapsed_ms)
 
     if response.status_code != 200:
         logger.error(f"OpenAI API error: {response.status_code} - {response.text}")
