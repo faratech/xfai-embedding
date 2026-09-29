@@ -36,6 +36,10 @@ OPENAI_MODEL = "text-embedding-3-small"  # 1536 dimensions, matches cached embed
 # ledger until 2026-09-18.
 TOKEN_TRACK_URL = os.getenv("TOKEN_TRACK_URL", "http://127.0.0.1:8001/token/track")
 MAX_TOKENS = 8191  # text-embedding-3-small context limit
+# Char bound on /embed + /embed_batch inputs, applied server-side (not a 422):
+# loopback callers legitimately post more (ideaengine slices at 30k, mcp at
+# 10k), and both already expect the service to truncate long text.
+MAX_TEXT_CHARS = 8000
 MAX_BATCH_TOKENS = 200_000  # API limit is 300k; legacy corpus counts ~30% higher server-side
 MAX_BATCH_RETRIES = 6
 BATCH_REQUEST_DELAY_SECONDS = 2.0
@@ -387,7 +391,7 @@ app = FastAPI(
 async def health_check():
     """Check service health."""
     return HealthResponse(
-        status="healthy" if OPENAI_API_KEY else "degraded",
+        status="healthy" if OPENAI_API_KEY and RERANK_MODEL is not None else "degraded",
         openai_configured=bool(OPENAI_API_KEY),
         model=OPENAI_MODEL,
         rerank_model=RERANK_MODEL_NAME if RERANK_MODEL else None
@@ -398,7 +402,7 @@ async def health_check():
 async def embed(request: EmbedRequest):
     """Generate embedding for a single text using OpenAI."""
     try:
-        embedding = await get_openai_embedding(request.text)
+        embedding = await get_openai_embedding(request.text[:MAX_TEXT_CHARS])
         return EmbedResponse(
             embedding=embedding,
             dimensions=len(embedding)
@@ -414,7 +418,7 @@ async def embed(request: EmbedRequest):
 async def embed_batch(request: EmbedBatchRequest):
     """Generate embeddings for multiple texts using OpenAI."""
     try:
-        texts = [t for t in request.texts if t and t.strip()]
+        texts = [t[:MAX_TEXT_CHARS] for t in request.texts if t and t.strip()]
         if not texts:
             raise HTTPException(status_code=400, detail="No valid texts provided")
 
