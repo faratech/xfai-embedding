@@ -19,9 +19,11 @@ Environment="MKL_NUM_THREADS=1"
 # Limit glibc arenas: default 8×nproc holds freed pages per-arena, causing
 # severe fragmentation for bursty model + BLAS allocations.
 Environment="MALLOC_ARENA_MAX=2"
-ExecStart=/usr/local/bin/python3 server.py
+ExecStart=/usr/bin/python3.14 server.py
+KillSignal=SIGINT
+TimeoutStopSec=10
 Restart=always
-RestartSec=5
+RestartSec=1
 StandardOutput=journal
 StandardError=journal
 
@@ -32,6 +34,7 @@ ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/web/services/xfai-embedding
 ReadWritePaths=/opt/xfai-embedding/cache
+ReadOnlyPaths=/web/.env
 
 [Install]
 WantedBy=multi-user.target
