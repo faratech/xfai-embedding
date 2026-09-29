@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk, scan
 
+from es_vector_utils import l2_normalize
+
 # Configuration
 ES_HOST = "http://localhost:9200"
 EMBED_URL = "http://127.0.0.1:8765/embed_batch"
@@ -111,7 +113,8 @@ def prepare_bulk_updates(docs_with_vectors, index_name):
             "_op_type": "update",
             "_index": index_name,
             "_id": doc_id,
-            "doc": {"content_vector": vector}
+            # dot_product mapping rejects non-unit vectors (#822).
+            "doc": {"content_vector": l2_normalize(vector)}
         })
     return actions
 

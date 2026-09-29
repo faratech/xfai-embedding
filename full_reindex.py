@@ -5,6 +5,7 @@ Uses fresh DB connections per batch to avoid timeout issues.
 """
 
 import asyncio
+import argparse
 import aiohttp
 import time
 import sys
@@ -12,6 +13,8 @@ import re
 import pymysql
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import bulk
+
+from es_vector_utils import l2_normalize
 
 # Configuration
 ES_HOST = "http://localhost:9200"
@@ -167,9 +170,17 @@ async def process_batch(session, es, docs, stats):
     texts = [d.pop('_text') for d in docs]
     embeddings = await get_embeddings(session, texts)
 
-    if embeddings and len(embeddings) == len(docs):
-        for doc, emb in zip(docs, embeddings):
-            doc['content_vector'] = emb
+    # Audit #823: an embed outage used to index the docs anyway — a
+    # vectorless corpus assembled silently. A full reindex with missing
+    # embeddings is a failed run; abort so nothing vectorless lands.
+    if not embeddings or len(embeddings) != len(docs):
+        raise RuntimeError(
+            f"embed service returned {len(embeddings) if embeddings else 0} "
+            f"embeddings for {len(docs)} docs — aborting rather than indexing "
+            "vectorless documents")
+
+    for doc, emb in zip(docs, embeddings):
+        doc['content_vector'] = l2_normalize(emb)
 
     actions = [{'_index': ES_INDEX, '_id': d.pop('_id'), **d} for d in docs]
 
@@ -201,9 +212,16 @@ def create_index(es):
                 "discussion_id": {"type": "long"},
                 "hidden": {"type": "boolean"},
                 "content_vector": {
-                    "type": "dense_vector", "dims": 384, "index": True,
-                    "similarity": "cosine",
-                    "index_options": {"type": "int8_hnsw", "m": 16, "ef_construction": 100}
+                    # Audit #823: this was dims 384 / cosine / int8_hnsw while
+                    # the service, the PHP client and MySQL all use 1536-d
+                    # dot_product vectors — every vector-carrying doc would
+                    # have been rejected, and candidate_cosine's
+                    # 2*score-1 rescaling assumes dot_product. Mirrors the
+                    # live wf_wf mapping.
+                    "type": "dense_vector", "dims": 1536, "index": True,
+                    "similarity": "dot_product",
+                    "index_options": {"type": "bbq_hnsw", "m": 16, "ef_construction": 100,
+                                      "rescore_vector": {"oversample": 3.0}}
                 }
             }
         }
@@ -211,7 +229,48 @@ def create_index(es):
     es.indices.create(index=ES_INDEX, body=mapping)
 
 
+def embed_preflight():
+    """One real embed call before anything destructive (#823)."""
+    import urllib.request
+    import json as _json
+    req = urllib.request.Request(
+        EMBED_URL,
+        data=_json.dumps({"texts": ["preflight"], "type": "document"}).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = _json.loads(resp.read())
+    embs = data.get("embeddings") or []
+    if len(embs) != 1 or len(embs[0]) != 1536:
+        raise RuntimeError(
+            f"embed service unhealthy: got {len(embs)} embedding(s) of "
+            f"dim {len(embs[0]) if embs else 0}, need 1 x 1536 — refusing to "
+            "recreate the index")
+
+
 async def main():
+    ap = argparse.ArgumentParser(description="Full reindex: MySQL -> Embeddings -> ES")
+    ap.add_argument("--yes", action="store_true",
+                    help="required: this DELETES the live wf_wf index and re-embeds the corpus")
+    args = ap.parse_args()
+    if not args.yes:
+        ap.error("refusing to run without --yes: this deletes the live "
+                 "wf_wf index before re-embedding (audit #823)")
+
+    # One writer at a time; the delete/recreate window must not overlap a
+    # second run (or generate_all's phase writes).
+    lock = open("/run/wf-full-reindex.lock", "w")
+    try:
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as e:
+        sys.exit(f"another full-reindex run holds /run/wf-full-reindex.lock: {e}")
+
+    print("Embed service preflight...")
+    embed_preflight()
+    print("  OK (1 x 1536)\n")
+
     print("Full Reindex: MySQL -> Embeddings -> ES")
     print(f"Workers: {NUM_WORKERS}, Batch: {BATCH_SIZE}\n")
 

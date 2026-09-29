@@ -133,7 +133,9 @@ class RerankRequest(BaseModel):
     # dedupe gate scores BOTH directions of every pair, so per-pair requests
     # doubled the per-request overhead. Mutually exclusive with query/documents.
     pairs: Optional[List[RerankPair]] = Field(None, min_length=1, max_length=100, description="Independent query/document pairs to score")
-    top_k: int = Field(default=10, ge=1, le=100, description="Number of top results to return")
+    # Audit #835: None = "no explicit cap" — pairs mode returns everything;
+    # the query/documents path below treats None as the historical default 10.
+    top_k: Optional[int] = Field(default=None, ge=1, le=100, description="Number of top results to return")
 
 
 class RerankResult(BaseModel):
@@ -156,6 +158,18 @@ async def get_http_client() -> httpx.AsyncClient:
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
         )
     return HTTP_CLIENT
+
+
+# Audit #836: the loop holds only weak refs to tasks — a bare
+# ensure_future() meter can be garbage-collected before its POST completes
+# and the wf_ai_usage_log row is silently lost. Hold strong refs until done.
+_PENDING_METERS: set = set()
+
+
+def schedule_meter(coro) -> None:
+    task = asyncio.ensure_future(coro)
+    _PENDING_METERS.add(task)
+    task.add_done_callback(_PENDING_METERS.discard)
 
 
 async def _meter_embedding_usage(data: dict, request_source: str, n_inputs: int) -> None:
@@ -211,7 +225,7 @@ async def get_openai_embedding(text: str) -> List[float]:
         raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
 
     data = response.json()
-    asyncio.ensure_future(_meter_embedding_usage(data, "xfai_embed", 1))
+    schedule_meter(_meter_embedding_usage(data, "xfai_embed", 1))
     return data["data"][0]["embedding"]
 
 
@@ -273,7 +287,7 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
             raise HTTPException(status_code=502, detail=f"OpenAI API error: {status}")
 
         data = response.json()
-        asyncio.ensure_future(_meter_embedding_usage(data, "xfai_embed_batch", len(batch)))
+        schedule_meter(_meter_embedding_usage(data, "xfai_embed_batch", len(batch)))
         sorted_data = sorted(data["data"], key=lambda x: x["index"])
         embeddings.extend(item["embedding"] for item in sorted_data)
         if batch_index + 1 < len(batches):
@@ -418,7 +432,12 @@ async def embed(request: EmbedRequest):
 async def embed_batch(request: EmbedBatchRequest):
     """Generate embeddings for multiple texts using OpenAI."""
     try:
-        texts = [t[:MAX_TEXT_CHARS] for t in request.texts if t and t.strip()]
+        # Audit #834: blanks used to be filtered out here, returning N-1
+        # embeddings for an N-text request — any caller mapping
+        # embeddings[i] -> texts[i] silently mis-assigns. Fail closed.
+        if any(t is None or not t.strip() for t in request.texts):
+            raise HTTPException(status_code=422, detail="blank or empty text in batch")
+        texts = [t[:MAX_TEXT_CHARS] for t in request.texts]
         if not texts:
             raise HTTPException(status_code=400, detail="No valid texts provided")
 
@@ -520,7 +539,13 @@ async def rerank(request: RerankRequest):
                 for i, (pair, score) in enumerate(scored)
             ]
             results.sort(key=lambda r: r.score, reverse=True)
-            return results[: request.top_k]
+            # Audit #835: pairs mode must return what it was given — the
+            # default top_k (10) silently truncated larger pair sets. The
+            # known consumer passes top_k: len(chunk) and re-keys by echoed
+            # id, so honour top_k only when the caller set it explicitly.
+            if request.top_k is not None:
+                return results[: request.top_k]
+            return results
 
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(THREAD_POOL, score_pairs)
@@ -540,7 +565,9 @@ async def rerank(request: RerankRequest):
             run_cross_encoder_rerank,
             request.query,
             request.documents,
-            request.top_k
+            # query/documents keeps the historical default 10 when the
+            # caller omits top_k (#835).
+            request.top_k if request.top_k is not None else 10
         )
 
         return RerankResponse(

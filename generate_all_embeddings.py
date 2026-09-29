@@ -40,6 +40,7 @@ load_dotenv('/web/.config')
 
 from db_pool import get_async_db_cursor
 from embedding_hash_utils import compute_content_hash
+from es_vector_utils import l2_normalize, count_bulk_rejections
 
 # Configuration
 EMBEDDING_MODEL = "text-embedding-3-small"
@@ -367,16 +368,25 @@ class CombinedEmbeddingGenerator:
                 "_op_type": "update",
                 "_index": ES_INDEX,
                 "_id": doc_id,
-                "doc": {"content_vector": emb}
+                # dot_product mapping rejects non-unit vectors (#822) — the
+                # PHP pipeline normalizes at this same boundary.
+                "doc": {"content_vector": l2_normalize(emb)}
             })
 
         if not actions:
             return 0
 
         success = 0
-        for ok, _ in streaming_bulk(self.es, actions, raise_on_error=False):
+        rejected = 0
+        for ok, info in streaming_bulk(self.es, actions, raise_on_error=False):
             if ok:
                 success += 1
+            elif rejected < 3:
+                rejected += count_bulk_rejections(ok, info, "write_es")
+            else:
+                rejected += 1
+        if rejected:
+            print(f"  write_es: {rejected} of {len(actions)} docs rejected by ES", flush=True)
         return success
 
     # ── Process a batch ─────────────────────────────────────────────────
@@ -499,11 +509,20 @@ class CombinedEmbeddingGenerator:
                         "_op_type": "update",
                         "_index": ES_INDEX,
                         "_id": f"thread-{row['thread_id']}",
-                        "doc": {"content_vector": emb}
+                        # MySQL is the raw store; ES dot_product needs unit
+                        # length (#822).
+                        "doc": {"content_vector": l2_normalize(emb)}
                     })
-                for ok, _ in streaming_bulk(self.es, actions, raise_on_error=False):
+                rejected = 0
+                for ok, info in streaming_bulk(self.es, actions, raise_on_error=False):
                     if ok:
                         filled += 1
+                    elif rejected < 3:
+                        rejected += count_bulk_rejections(ok, info, "backfill_es")
+                    else:
+                        rejected += 1
+                if rejected:
+                    print(f"  backfill_es: {rejected} of {len(actions)} docs rejected by ES", flush=True)
 
             if self.shutdown:
                 break
@@ -553,6 +572,20 @@ class CombinedEmbeddingGenerator:
             if self.shutdown:
                 break
             batch = missing_posts[batch_start:batch_start + 100]
+            # Audit #837: hash the live text so hash-based drift consumers
+            # agree with needs_update=0 — writing '' made every drift pass
+            # light these rows up for paid regeneration.
+            items_by_id = {}
+            async with get_async_db_cursor(dict_cursor=True) as cur:
+                placeholders = ",".join(["%s"] * len(batch))
+                await cur.execute(f"""
+                    SELECT p.post_id, p.message, t.title
+                    FROM xf_post p JOIN xf_thread t ON t.thread_id = p.thread_id
+                    WHERE p.post_id IN ({placeholders})
+                """, batch)
+                for r in await cur.fetchall():
+                    items_by_id[int(r['post_id'])] = {'post_id': int(r['post_id']),
+                                                      'message': r['message'], 'title': r['title']}
             doc_ids = [{"_index": ES_INDEX, "_id": f"post-{pid}"} for pid in batch]
 
             try:
@@ -569,8 +602,12 @@ class CombinedEmbeddingGenerator:
                 if len(emb) != EMBEDDING_DIM:
                     continue
                 pid = int(doc["_id"].split("-", 1)[1])
+                item = items_by_id.get(pid)
+                if item is None:
+                    continue
+                text, truncated = self.prepare_text(item, "post")
                 blob = np.array(emb, dtype=np.float32).tobytes()
-                rows.append((pid, None, blob, EMBEDDING_DIM))
+                rows.append((pid, None, blob, EMBEDDING_DIM, compute_content_hash(text), 1 if truncated else 0))
 
             if rows:
                 try:
@@ -578,7 +615,7 @@ class CombinedEmbeddingGenerator:
                         await cur.executemany("""
                             INSERT INTO openai_embeddings
                             (post_id, thread_id, embedding, embedding_length, content_hash, is_truncated, needs_update, created_at)
-                            VALUES (%s, %s, %s, %s, '', 0, 0, NOW())
+                            VALUES (%s, %s, %s, %s, %s, %s, 0, NOW())
                             ON DUPLICATE KEY UPDATE
                                 embedding = VALUES(embedding),
                                 embedding_length = VALUES(embedding_length),
@@ -594,6 +631,16 @@ class CombinedEmbeddingGenerator:
             if self.shutdown:
                 break
             batch = missing_threads[batch_start:batch_start + 100]
+            items_by_id = {}
+            async with get_async_db_cursor(dict_cursor=True) as cur:
+                placeholders = ",".join(["%s"] * len(batch))
+                await cur.execute(f"""
+                    SELECT thread_id, title FROM xf_thread
+                    WHERE thread_id IN ({placeholders})
+                """, batch)
+                for r in await cur.fetchall():
+                    items_by_id[int(r['thread_id'])] = {'thread_id': int(r['thread_id']),
+                                                        'title': r['title']}
             doc_ids = [{"_index": ES_INDEX, "_id": f"thread-{tid}"} for tid in batch]
 
             try:
@@ -610,8 +657,12 @@ class CombinedEmbeddingGenerator:
                 if len(emb) != EMBEDDING_DIM:
                     continue
                 tid = int(doc["_id"].split("-", 1)[1])
+                item = items_by_id.get(tid)
+                if item is None:
+                    continue
+                text, truncated = self.prepare_text(item, "thread")
                 blob = np.array(emb, dtype=np.float32).tobytes()
-                rows.append((None, tid, blob, EMBEDDING_DIM))
+                rows.append((None, tid, blob, EMBEDDING_DIM, compute_content_hash(text), 1 if truncated else 0))
 
             if rows:
                 try:
@@ -619,7 +670,7 @@ class CombinedEmbeddingGenerator:
                         await cur.executemany("""
                             INSERT INTO openai_embeddings
                             (post_id, thread_id, embedding, embedding_length, content_hash, is_truncated, needs_update, created_at)
-                            VALUES (%s, %s, %s, %s, '', 0, 0, NOW())
+                            VALUES (%s, %s, %s, %s, %s, %s, 0, NOW())
                             ON DUPLICATE KEY UPDATE
                                 embedding = VALUES(embedding),
                                 embedding_length = VALUES(embedding_length),

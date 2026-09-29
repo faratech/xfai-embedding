@@ -10,6 +10,8 @@ import httpx
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan, streaming_bulk
 
+from es_vector_utils import l2_normalize, count_bulk_rejections
+
 ES_HOST = "http://localhost:9200"
 ES_INDEX = "wf_wf"
 OPENAI_MODEL = "text-embedding-3-small"
@@ -112,14 +114,22 @@ def process_batch(batch, es):
             "_op_type": "update",
             "_index": ES_INDEX,
             "_id": doc_id,
-            "doc": {"content_vector": emb}
+            # dot_product mapping rejects non-unit vectors (#822).
+            "doc": {"content_vector": l2_normalize(emb)}
         })
 
     # Execute bulk update
     success = 0
+    rejected = 0
     for ok, result in streaming_bulk(es, actions, raise_on_error=False):
         if ok:
             success += 1
+        elif rejected < 3:
+            rejected += count_bulk_rejections(ok, result, "fill_missing")
+        else:
+            rejected += 1
+    if rejected:
+        print(f"fill_missing: {rejected} of {len(actions)} docs rejected by ES", flush=True)
 
     return success
 
