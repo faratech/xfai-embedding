@@ -7,6 +7,7 @@ Streams through ES docs without vectors and updates them.
 import os
 import time
 import httpx
+import sys
 from elasticsearch import Elasticsearch
 from elasticsearch.helpers import scan, streaming_bulk
 
@@ -59,6 +60,12 @@ def get_openai_embeddings(texts: list[str]) -> list[list[float]]:
             return []
 
         data = response.json()
+        if "/web/fastapi_app" not in sys.path:
+            sys.path.insert(0, "/web/fastapi_app")
+        from direct_metering import meter_embedding_sync
+        meter_embedding_sync(data, model=OPENAI_MODEL, request_source="xfai_embed_fill_missing",
+                             n_inputs=len(texts), provider="openai",
+                             response_time_ms=int(response.elapsed.total_seconds() * 1000))
         sorted_data = sorted(data["data"], key=lambda x: x["index"])
         return [item["embedding"] for item in sorted_data]
 

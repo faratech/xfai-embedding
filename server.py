@@ -10,6 +10,7 @@ XFAI Embedding Service - Hybrid OpenAI + Local embeddings.
 import os
 import logging
 import asyncio
+import uuid
 import httpx
 from collections import OrderedDict
 import hashlib
@@ -172,7 +173,9 @@ def schedule_meter(coro) -> None:
     task.add_done_callback(_PENDING_METERS.discard)
 
 
-async def _meter_embedding_usage(data: dict, request_source: str, n_inputs: int) -> None:
+async def _meter_embedding_usage(data: dict, request_source: str, n_inputs: int,
+                                 response_time_ms: int | None = None,
+                                 provider_request_id: str | None = None) -> None:
     """Best-effort ledger row for one embeddings response; never raises."""
     try:
         usage = data.get("usage") or {}
@@ -186,6 +189,15 @@ async def _meter_embedding_usage(data: dict, request_source: str, n_inputs: int)
             "input_text": f"{n_inputs} embedding input(s)",
             "output_text": "",
             "request_source": request_source,
+            "provider": "openai",
+            "requested_model": OPENAI_MODEL,
+            "api_operation": "embeddings",
+            "usage_event_id": hashlib.sha256(f"openai:embeddings:{provider_request_id}".encode()).hexdigest() if provider_request_id else uuid.uuid4().hex,
+            "response_id": data.get("id"),
+            "status": "completed",
+            "usage_origin": "reported",
+            "response_time_ms": response_time_ms,
+            "provider_request_id": provider_request_id,
             "usage_data": {"input_tokens": prompt, "output_tokens": 0, "total_tokens": prompt},
         }, timeout=5.0)
     except Exception as exc:
@@ -225,7 +237,8 @@ async def get_openai_embedding(text: str) -> List[float]:
         raise HTTPException(status_code=502, detail=f"OpenAI API error: {response.status_code}")
 
     data = response.json()
-    schedule_meter(_meter_embedding_usage(data, "xfai_embed", 1))
+    schedule_meter(_meter_embedding_usage(data, "xfai_embed", 1, elapsed_ms,
+                                          response.headers.get("x-request-id")))
     return data["data"][0]["embedding"]
 
 
@@ -256,6 +269,7 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
     for batch_index, batch in enumerate(batches):
         response = None
         for attempt in range(MAX_BATCH_RETRIES):
+            batch_started = time.monotonic()
             response = await client.post(
                 "https://api.openai.com/v1/embeddings",
                 headers={
@@ -287,7 +301,9 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
             raise HTTPException(status_code=502, detail=f"OpenAI API error: {status}")
 
         data = response.json()
-        schedule_meter(_meter_embedding_usage(data, "xfai_embed_batch", len(batch)))
+        schedule_meter(_meter_embedding_usage(data, "xfai_embed_batch", len(batch),
+                                              round((time.monotonic() - batch_started) * 1000),
+                                              response.headers.get("x-request-id")))
         sorted_data = sorted(data["data"], key=lambda x: x["index"])
         embeddings.extend(item["embedding"] for item in sorted_data)
         if batch_index + 1 < len(batches):
