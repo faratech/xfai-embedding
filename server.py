@@ -19,6 +19,7 @@ import time
 import resource
 import json
 from pair_score_cache import PairScoreCache
+from rerank_metrics import InferenceMetrics
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -73,6 +74,7 @@ if not OPENAI_API_KEY:
 # Cross-encoder config
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"  # Higher accuracy reranker (~130ms for 20 docs)
 RERANK_MODEL = None  # Loaded at startup
+RERANK_TORCH_VERSION = None
 def performance_setting(name, default):
     if name in os.environ:
         return os.environ[name]
@@ -99,6 +101,7 @@ if RERANK_WORKERS not in (1, 2, 4) or RERANK_TORCH_THREADS not in (1, 2, 4):
 # and avoids 8MB virtual stack × dozens of idle threads.
 THREAD_POOL = ThreadPoolExecutor(max_workers=RERANK_WORKERS, thread_name_prefix="xfai-rerank")
 _PAIR_SCORE_CACHE = PairScoreCache()
+_INFERENCE_METRICS = InferenceMetrics()
 _PERFORMANCE_COUNTERS = {'pair_requests': 0, 'requested_pairs': 0, 'document_requests': 0,
                          'requested_documents': 0, 'document_inference_pairs': 0}
 
@@ -108,6 +111,9 @@ async def performance_report_task():
         await asyncio.sleep(60)
         usage = resource.getrusage(resource.RUSAGE_SELF)
         logger.info('rerank_performance %s', json.dumps({**_PERFORMANCE_COUNTERS,
+            **_INFERENCE_METRICS.snapshot(),
+            'recorded_at': time.time(), 'pid': os.getpid(),
+            'torch_version': RERANK_TORCH_VERSION,
             'pair_cache_hits': _PAIR_SCORE_CACHE.hits, 'pair_cache_misses': _PAIR_SCORE_CACHE.misses,
             'pair_cache_coalesced': _PAIR_SCORE_CACHE.coalesced,
             'pair_cache_entries': len(_PAIR_SCORE_CACHE.values),
@@ -287,9 +293,21 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OpenAI API key not configured")
 
-    texts = [truncate_to_tokens(t) for t in texts]
+    prepared = []
+    token_counts = []
+    for text in texts:
+        tokens = TOKENIZER.encode(text)
+        if len(tokens) <= MAX_TOKENS:
+            prepared.append(text)
+            token_counts.append(len(tokens))
+        else:
+            text = TOKENIZER.decode(tokens[:MAX_TOKENS])
+            prepared.append(text)
+            # A cut may end within a Unicode character; retain the original
+            # count of the decoded text rather than assuming MAX_TOKENS.
+            token_counts.append(len(TOKENIZER.encode(text)))
+    texts = prepared
     client = await get_http_client()
-    token_counts = [len(TOKENIZER.encode(text)) for text in texts]
     batches: List[List[str]] = []
     current_batch: List[str] = []
     current_tokens = 0
@@ -354,9 +372,10 @@ async def get_openai_embeddings_batch(texts: List[str]) -> List[List[float]]:
 
 def load_rerank_model():
     """Load cross-encoder model for reranking."""
-    global RERANK_MODEL
+    global RERANK_MODEL, RERANK_TORCH_VERSION
     try:
         import torch
+        RERANK_TORCH_VERSION = torch.__version__
         torch.set_num_threads(RERANK_TORCH_THREADS)
         torch.set_grad_enabled(False)
         logger.info("Configured PyTorch threads=%d executor_workers=%d", RERANK_TORCH_THREADS, RERANK_WORKERS)
@@ -515,7 +534,7 @@ async def embed_batch(request: EmbedBatchRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def run_cross_encoder_rerank(query: str, documents: List[RerankDocument], top_k: int) -> List[RerankResult]:
+def run_cross_encoder_rerank(query: str, documents: List[RerankDocument], top_k: int, queued_at=None) -> List[RerankResult]:
     """Run cross-encoder inference with deterministic LRU score cache."""
     if RERANK_MODEL is None:
         raise ValueError("Cross-encoder model not loaded")
@@ -538,7 +557,7 @@ def run_cross_encoder_rerank(query: str, documents: List[RerankDocument], top_k:
     # Run inference only on uncached pairs
     if uncached_pairs:
         _PERFORMANCE_COUNTERS['document_inference_pairs'] += len(uncached_pairs)
-        computed_scores = RERANK_MODEL.predict(uncached_pairs, show_progress_bar=False)
+        computed_scores = _INFERENCE_METRICS.predict(RERANK_MODEL, uncached_pairs, 'documents', queued_at)
         with _RERANK_CACHE_LOCK:
             for idx, (q, txt), sc in zip(uncached_indices, uncached_pairs, computed_scores):
                 score_val = float(sc)
@@ -587,8 +606,9 @@ async def rerank(request: RerankRequest):
         _PERFORMANCE_COUNTERS['pair_requests'] += 1
         _PERFORMANCE_COUNTERS['requested_pairs'] += len(request.pairs)
         model = RERANK_MODEL
+        queued_at = time.monotonic()
         def predict(pairs):
-            return model.predict(pairs, show_progress_bar=False)
+            return _INFERENCE_METRICS.predict(model, pairs, 'pairs', queued_at)
         pairs = [(p.query, p.document) for p in request.pairs]
         if PAIR_CACHE_ENABLED:
             scores = await _PAIR_SCORE_CACHE.scores(
@@ -625,7 +645,8 @@ async def rerank(request: RerankRequest):
             request.documents,
             # query/documents keeps the historical default 10 when the
             # caller omits top_k (#835).
-            request.top_k if request.top_k is not None else 10
+            request.top_k if request.top_k is not None else 10,
+            time.monotonic()
         )
 
         return RerankResponse(

@@ -82,6 +82,17 @@ CPU controls (2026-10-13) load environment values first, then `/web/.env` and
   cache hits/misses/coalescing and process CPU every minute. HTTP schemas are
   unchanged. Cache identity includes the loaded model instance and max-length
   contract; a service restart starts a fresh cache.
+- Follow-up profiling records actual inferred pairs, batch-size distribution,
+  worker queue time, concurrent inference and process CPU during active inference.
+  Overlapping calls contribute to that process CPU window once. It includes other
+  process work during the window; minute snapshots are used for per-pair estimates.
+  PID and loaded Torch version identify restarts and library changes.
+- Batch embedding tokenization reuses the first count for untruncated text;
+  Unicode truncation retains exact decoded text and its recalculated count.
+- The public-corpus batching replay is `ops/profile_rerank_cpu.py` in `/web`.
+  Alternative batch layouts produced maximum score differences of 1.91e-6,
+  exceeding the 1e-6 numerical qualification. Production keeps the original
+  batch layout, model, activation, worker count and thread count.
 
 Rollback: set pair caching to `0`, retain 4/4, and restart only this service.
 
