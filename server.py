@@ -16,6 +16,9 @@ from collections import OrderedDict
 import hashlib
 import threading
 import time
+import resource
+import json
+from pair_score_cache import PairScoreCache
 from typing import List, Optional
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -70,10 +73,47 @@ if not OPENAI_API_KEY:
 # Cross-encoder config
 RERANK_MODEL_NAME = "cross-encoder/ms-marco-MiniLM-L-12-v2"  # Higher accuracy reranker (~130ms for 20 docs)
 RERANK_MODEL = None  # Loaded at startup
+def performance_setting(name, default):
+    if name in os.environ:
+        return os.environ[name]
+    values = {}
+    for path in ('/web/.env', '/web/.config'):
+        try:
+            with open(path) as stream:
+                for line in stream:
+                    if '=' in line and not line.lstrip().startswith('#'):
+                        key, value = line.strip().split('=', 1)
+                        values.setdefault(key, value.strip().strip('\"\''))
+        except OSError:
+            continue
+    return values.get(name, default)
+
+
+RERANK_WORKERS = int(performance_setting('XFAI_RERANK_WORKERS', '4'))
+RERANK_TORCH_THREADS = int(performance_setting('XFAI_RERANK_TORCH_THREADS', '4'))
+PAIR_CACHE_ENABLED = performance_setting('XFAI_RERANK_PAIR_CACHE', '0') == '1'
+if RERANK_WORKERS not in (1, 2, 4) or RERANK_TORCH_THREADS not in (1, 2, 4):
+    raise ValueError('Rerank workers/threads must be 1, 2 or 4')
 # Cap workers: torch.set_num_threads(1) means parallel reranks just contend
 # for one CPU. 4 is plenty for the load-once + per-request inference uses,
 # and avoids 8MB virtual stack × dozens of idle threads.
-THREAD_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="xfai-rerank")
+THREAD_POOL = ThreadPoolExecutor(max_workers=RERANK_WORKERS, thread_name_prefix="xfai-rerank")
+_PAIR_SCORE_CACHE = PairScoreCache()
+_PERFORMANCE_COUNTERS = {'pair_requests': 0, 'requested_pairs': 0, 'document_requests': 0,
+                         'requested_documents': 0, 'document_inference_pairs': 0}
+
+
+async def performance_report_task():
+    while True:
+        await asyncio.sleep(60)
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        logger.info('rerank_performance %s', json.dumps({**_PERFORMANCE_COUNTERS,
+            'pair_cache_hits': _PAIR_SCORE_CACHE.hits, 'pair_cache_misses': _PAIR_SCORE_CACHE.misses,
+            'pair_cache_coalesced': _PAIR_SCORE_CACHE.coalesced,
+            'pair_cache_entries': len(_PAIR_SCORE_CACHE.values),
+            'pair_cache_enabled': PAIR_CACHE_ENABLED, 'workers': RERANK_WORKERS,
+            'torch_threads': RERANK_TORCH_THREADS,
+            'process_cpu_seconds': usage.ru_utime+usage.ru_stime}, sort_keys=True))
 
 # Deterministic in-memory LRU cache for cross-encoder scores: key -> score (float)
 _RERANK_CACHE = OrderedDict()
@@ -317,9 +357,9 @@ def load_rerank_model():
     global RERANK_MODEL
     try:
         import torch
-        torch.set_num_threads(4)
+        torch.set_num_threads(RERANK_TORCH_THREADS)
         torch.set_grad_enabled(False)
-        logger.info("Configured PyTorch to use 4 threads and disabled gradients globally")
+        logger.info("Configured PyTorch threads=%d executor_workers=%d", RERANK_TORCH_THREADS, RERANK_WORKERS)
     except ImportError:
         logger.warning("torch not installed - threading options skipped")
     except Exception as e:
@@ -394,6 +434,7 @@ async def lifespan(app: FastAPI):
     # Start HTTP/2 keepalive task to OpenAI
     keepalive_task = asyncio.create_task(openai_connection_keepalive(45))
     app.state.keepalive_task = keepalive_task
+    performance_task = asyncio.create_task(performance_report_task())
 
     # Release model-loading memory spikes back to the OS
     _malloc_trim()
@@ -401,11 +442,15 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup
+    for task in (trim_task, keepalive_task, performance_task):
+        task.cancel()
+    await asyncio.gather(trim_task, keepalive_task, performance_task, return_exceptions=True)
     global HTTP_CLIENT
     if HTTP_CLIENT is not None:
         await HTTP_CLIENT.aclose()
         HTTP_CLIENT = None
         logger.info("Shared HTTP client closed gracefully")
+    await _PAIR_SCORE_CACHE.finish()
     THREAD_POOL.shutdown(wait=False)
 
 
@@ -492,6 +537,7 @@ def run_cross_encoder_rerank(query: str, documents: List[RerankDocument], top_k:
 
     # Run inference only on uncached pairs
     if uncached_pairs:
+        _PERFORMANCE_COUNTERS['document_inference_pairs'] += len(uncached_pairs)
         computed_scores = RERANK_MODEL.predict(uncached_pairs, show_progress_bar=False)
         with _RERANK_CACHE_LOCK:
             for idx, (q, txt), sc in zip(uncached_indices, uncached_pairs, computed_scores):
@@ -538,33 +584,27 @@ async def rerank(request: RerankRequest):
             detail="Use either 'pairs' or 'query'+'documents', not both."
         )
     if request.pairs and not (request.documents and request.query):
-        # Independent (query, document) pairs — each scored on its own.
-        def score_pairs() -> List[RerankResult]:
-            scored = [
-                (pair, float(score))
-                for pair, score in zip(
-                    request.pairs,
-                    RERANK_MODEL.predict(
-                        [(p.query, p.document) for p in request.pairs],
-                        show_progress_bar=False,
-                    ),
-                )
-            ]
-            results = [
-                RerankResult(id=pair.id if pair.id else str(i), score=score, index=i)
-                for i, (pair, score) in enumerate(scored)
-            ]
-            results.sort(key=lambda r: r.score, reverse=True)
-            # Audit #835: pairs mode must return what it was given — the
-            # default top_k (10) silently truncated larger pair sets. The
-            # known consumer passes top_k: len(chunk) and re-keys by echoed
-            # id, so honour top_k only when the caller set it explicitly.
-            if request.top_k is not None:
-                return results[: request.top_k]
-            return results
-
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(THREAD_POOL, score_pairs)
+        _PERFORMANCE_COUNTERS['pair_requests'] += 1
+        _PERFORMANCE_COUNTERS['requested_pairs'] += len(request.pairs)
+        model = RERANK_MODEL
+        def predict(pairs):
+            return model.predict(pairs, show_progress_bar=False)
+        pairs = [(p.query, p.document) for p in request.pairs]
+        if PAIR_CACHE_ENABLED:
+            scores = await _PAIR_SCORE_CACHE.scores(
+                (RERANK_MODEL_NAME, id(model), 'cross-encoder-predict-max512-v1'),
+                pairs, predict, THREAD_POOL)
+        else:
+            scores = await asyncio.get_running_loop().run_in_executor(THREAD_POOL, predict, pairs)
+            scores = [float(s) for s in scores]
+            import math
+            if len(scores) != len(pairs) or not all(math.isfinite(s) for s in scores):
+                raise ValueError('Incomplete or nonfinite cross-encoder output')
+        results = [RerankResult(id=p.id if p.id else str(i), score=score, index=i)
+                   for i, (p, score) in enumerate(zip(request.pairs, scores))]
+        results.sort(key=lambda r: r.score, reverse=True)
+        if request.top_k is not None:
+            results = results[:request.top_k]
         return RerankResponse(results=results, model=RERANK_MODEL_NAME)
 
     if not (request.documents and request.query):
@@ -575,6 +615,8 @@ async def rerank(request: RerankRequest):
 
     try:
         # Run inference in thread pool to avoid blocking event loop
+        _PERFORMANCE_COUNTERS['document_requests'] += 1
+        _PERFORMANCE_COUNTERS['requested_documents'] += len(request.documents)
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(
             THREAD_POOL,

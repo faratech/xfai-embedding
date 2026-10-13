@@ -68,6 +68,23 @@ The cross-encoder model runs blocking inference, so `server.py` dispatches it th
 
 ## Configuration
 
+CPU controls (2026-10-13) load environment values first, then `/web/.env` and
+`/web/.config` without override:
+
+- `XFAI_RERANK_PAIR_CACHE=1`: 50,000-entry exact ordered-pair LRU, with async
+  coalescing before executor submission. IDs and original indices stay outside
+  the key. Only complete finite outputs are cached; cancelled callers do not
+  cancel inference shared with other requests. Document caching is separate.
+- `XFAI_RERANK_WORKERS` and `XFAI_RERANK_TORCH_THREADS`: one of 1, 2 or 4.
+  Production retains 4/4 after matched tests showed latency regressions from
+  lower-CPU alternatives. Score and ranking parity passed all nine combinations.
+- Private journal `rerank_performance` records cumulative request/pair counts,
+  cache hits/misses/coalescing and process CPU every minute. HTTP schemas are
+  unchanged. Cache identity includes the loaded model instance and max-length
+  contract; a service restart starts a fresh cache.
+
+Rollback: set pair caching to `0`, retain 4/4, and restart only this service.
+
 Environment variables (all optional with defaults):
 - `XFAI_EMBED_HOST` (default: `127.0.0.1`)
 - `XFAI_EMBED_PORT` (default: `8765`)
