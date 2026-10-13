@@ -11,3 +11,4 @@ __pycache__/
 
 # Logs
 *.log
+generate_all_progress.json
